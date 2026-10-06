@@ -39,6 +39,7 @@
     "offline:build:assets": "node tools/make-offline.mjs --with-assets",
     "offline:verify": "node tools/verify-offline.mjs",
     "offline:browser": "node tools/verify-offline-browser.mjs",
+    "online:verify": "node tools/verify-online.mjs",
     "android:apk": "node tools/make-android-apk.mjs",
     "android:release": "node tools/make-android-apk.mjs && node tools/make-release.mjs"
   },

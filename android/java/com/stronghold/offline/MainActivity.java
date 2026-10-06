@@ -1,6 +1,7 @@
 package com.stronghold.offline;
 
 import android.app.Activity;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.os.Build;
@@ -31,17 +32,27 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * The whole app: one WebView, full-screen landscape, fed from the APK's own assets by {@link AssetInterceptor}.
+ * The app: a launcher screen, and one WebView that plays the game either way.
  *
- * <p>The page is loaded with {@code ?local=1} (public/js/main.js), the switch that boots the real match engine
- * inside the page instead of connecting to a server - so a solo run needs no Node process and no network. The app
- * declares no permissions at all, so that is enforced by the platform rather than promised by a flag.
+ * <p>Two modes, one client:
+ * <ul>
+ *   <li><b>Offline</b> - the copy of the client inside this APK, on the virtual asset origin with {@code ?local=1}
+ *       (public/js/main.js), which boots the real match engine inside the page: solo play with no server and no
+ *       network use at all.</li>
+ *   <li><b>Online</b> - the client loaded <em>from a server</em>, exactly as a desktop browser does, so 1-4 player
+ *       co-op works across devices. Loading the client from the server is deliberate: net.js verifies
+ *       PROTOCOL_VERSION during the handshake and the server turns a stale client away, so a client bundled in the
+ *       APK would break co-op as soon as the two builds drifted apart.</li>
+ * </ul>
  *
- * <p>One diagnostic exists, and only for the case where nothing can be seen: a full-screen report when the main
- * frame fails or the page has not booted within {@link #BOOT_TIMEOUT_MS}. It is invisible in normal use, and a tap
- * dismisses it - it must never be what keeps someone out of a working game.
+ * <p>The INTERNET permission exists for the online mode only; the offline mode never opens a socket (its assets are
+ * served from the APK by {@link AssetInterceptor}, on a virtual origin nothing else can reach).
+ *
+ * <p>One diagnostic remains, only for the case where nothing can be seen: a full-screen report when the main frame
+ * fails or the page has not booted within {@link #BOOT_TIMEOUT_MS}. It is invisible in normal use and a tap
+ * dismisses it.
  */
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements StartScreen.Listener {
 
     private static final String TAG = "StrongholdOffline";
     /** How long to wait for the page to boot before showing the full report. */
@@ -49,15 +60,21 @@ public class MainActivity extends Activity {
     private static final int PROBE_EVERY_MS = 2000;
     /** Kept for the report: the newest console lines and errors. */
     private static final int LOG_KEEP = 40;
+    /** The bundled client, on the asset origin. */
+    private static final String OFFLINE_URL = AssetInterceptor.ORIGIN + "/index.html?local=1";
 
     private WebView web;
     private AssetInterceptor interceptor;
+    private StartScreen start;
+    private SharedPreferences prefs;
     private FrameLayout root;
     private ScrollView overlay;
     private TextView overlayText;
     private final List<String> log = Collections.synchronizedList(new ArrayList<String>());
     private final Handler handler = new Handler(Looper.getMainLooper());
     private volatile boolean booted;
+    /** A page is on screen (immersive, and back returns to the launcher). */
+    private boolean inGame;
 
     /**
      * The probe asks the page what it has, and answers with a PLAIN-TEXT VERDICT PREFIX.
@@ -75,11 +92,9 @@ public class MainActivity extends Activity {
     private static final String PROBE_JS =
             "(function(){try{"
                     + "var e=document.getElementById('boot-err');"
-                    + "var cs=getComputedStyle(document.documentElement);"
                     + "var o={"
                     + "type:document.contentType,"
                     + "ready:document.readyState,"
-                    + "scripts:document.scripts.length,"
                     + "sp:!!globalThis.__SP__,"
                     + "engine:!!globalThis.__SP_OFFLINE__,"
                     + "importmap:(typeof HTMLScriptElement!=='undefined'&&HTMLScriptElement.supports)?HTMLScriptElement.supports('importmap'):null,"
@@ -87,15 +102,8 @@ public class MainActivity extends Activity {
                     + "lobby:!!document.querySelector('.mode-card'),"
                     + "game:!!document.querySelector('.shopbar, .gtop__exit, .gm__gear'),"
                     + "bootErr:(e&&e.textContent)?e.textContent:null,"
-                    + "vw:window.innerWidth+'x'+window.innerHeight,"
-                    + "vv:(window.visualViewport?Math.round(window.visualViewport.width)+'x'+Math.round(window.visualViewport.height):'-'),"
-                    + "dpr:Math.round(window.devicePixelRatio*100)/100,"
-                    + "root:cs.fontSize,"
-                    + "saL:cs.getPropertyValue('--sa-l').trim(),"
-                    + "saR:cs.getPropertyValue('--sa-r').trim(),"
-                    + "saT:cs.getPropertyValue('--sa-t').trim(),"
-                    + "saB:cs.getPropertyValue('--sa-b').trim(),"
-                    + "body:cs.getPropertyValue('width')+'/'+cs.getPropertyValue('height')"
+                    + "origin:location.origin,"
+                    + "vw:window.innerWidth+'x'+window.innerHeight"
                     + "};"
                     + "var ok=!!(o.sp||o.engine||o.game||o.title||o.lobby);"
                     + "if(!ok)return 'WAIT '+JSON.stringify(o);"
@@ -104,7 +112,7 @@ public class MainActivity extends Activity {
 
     private final Runnable probe = new Runnable() {
         @Override public void run() {
-            if (web == null) return;
+            if (web == null || !inGame) return;
             web.evaluateJavascript(PROBE_JS, value -> {
                 String v = value == null ? "" : value;
                 note("probe: " + v);
@@ -118,8 +126,17 @@ public class MainActivity extends Activity {
                     hideOverlay();
                     return;
                 }
-                if (!booted) handler.postDelayed(probe, PROBE_EVERY_MS);
+                if (!booted && inGame) handler.postDelayed(probe, PROBE_EVERY_MS);
             });
+        }
+    };
+
+    /** Fires if nothing has booted in time (a blank screen with no explanation is useless on a phone). */
+    private final Runnable bootTimeout = new Runnable() {
+        @Override public void run() {
+            if (inGame && !booted) {
+                showOverlay("the page did not boot within " + (BOOT_TIMEOUT_MS / 1000) + " s");
+            }
         }
     };
 
@@ -127,6 +144,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        prefs = getSharedPreferences(StartScreen.PREFS, MODE_PRIVATE);
 
         interceptor = new AssetInterceptor(getAssets());
 
@@ -172,16 +190,60 @@ public class MainActivity extends Activity {
         overlay = buildOverlay();
         root.addView(overlay, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        start = new StartScreen(this, this);
+        root.addView(start.view(), new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         setContentView(root);
 
-        goImmersive();
-        String url = AssetInterceptor.ORIGIN + "/index.html?local=1";
-        note("loading " + url);
-        web.loadUrl(url);
-        handler.postDelayed(probe, 3000);
-        handler.postDelayed(() -> { if (!booted) showOverlay("the page did not boot within "
-                + (BOOT_TIMEOUT_MS / 1000) + " s"); }, BOOT_TIMEOUT_MS);
+        showStartScreen();
     }
+
+    // ---- the launcher's two choices --------------------------------------------------------------------------
+
+    @Override public void onOffline() {
+        loadGame(OFFLINE_URL, "bundled (offline; no network use at all)");
+    }
+
+    @Override public void onOnline(String url) {
+        prefs.edit().putString(StartScreen.KEY_SERVER, start.currentAddress()).apply();
+        loadGame(url, "server");
+    }
+
+    private void loadGame(String url, String what) {
+        inGame = true;
+        booted = false;
+        hideOverlay();
+        start.hide();
+        goImmersive();
+        note("loading " + url + "  [" + what + "]");
+        web.loadUrl(url);
+        handler.removeCallbacks(probe);
+        handler.removeCallbacks(bootTimeout);
+        handler.postDelayed(probe, 3000);
+        handler.postDelayed(bootTimeout, BOOT_TIMEOUT_MS);
+    }
+
+    /** Back from the game returns here; back again leaves the app. */
+    private void showStartScreen() {
+        inGame = false;
+        handler.removeCallbacks(probe);
+        handler.removeCallbacks(bootTimeout);
+        hideOverlay();
+        if (web != null) web.loadUrl("about:blank");      // releases the page (and, online, drops the room seat)
+        showSystemBars();
+        start.show(prefs.getString(StartScreen.KEY_SERVER, ""));
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (inGame) {
+            showStartScreen();
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    // ---- diagnostics -----------------------------------------------------------------------------------------
 
     /** A full-screen, scrollable, selectable report; hidden until something goes wrong. */
     private ScrollView buildOverlay() {
@@ -227,11 +289,9 @@ public class MainActivity extends Activity {
      * Chromium reported 47 CSS px of left inset for a display cutout that is 15 PHYSICAL px - about 4.6 CSS px at
      * density 3.25, ten times the real thing - while its system bars are genuinely hidden. That inset pushed the
      * whole HUD (and the title screen) ~47 px to the right and left a visibly empty strip down the left, which is
-     * what the user saw next to a full-bleed board.
+     * what the user saw next to a full-bleed board. The values are forced to 0 so the UI lines up with the board.
      *
-     * The fix asked for is simply to make the UI full-bleed too, so the four variables are forced to 0 and the HUD
-     * lines up with the board. The real insets are still measured and logged here, so the diagnostics report what
-     * was overridden rather than hiding it - and the values stay available if a device ever needs them back.
+     * The real insets are still measured and logged, so the report shows what was overridden rather than hiding it.
      */
     private String safeAreaCss() {
         int[] m = measuredSafeAreaPx();
@@ -265,9 +325,8 @@ public class MainActivity extends Activity {
 
     /** Push {@link #safeAreaCss()} into the page (idempotent: one style element, rewritten each time). */
     private void applySafeArea() {
-        if (web == null) return;
+        if (web == null || !inGame) return;
         String css = safeAreaCss();
-        note("safe area: " + css);
         // The CSS text contains no quotes, so it can sit inside a single-quoted JS string as-is.
         web.evaluateJavascript(
                 "(function(){var id='sp-safe-area';var s=document.getElementById(id);"
@@ -280,15 +339,14 @@ public class MainActivity extends Activity {
     private void showOverlay(String why) {
         if (overlay == null) return;
         StringBuilder sb = new StringBuilder();
-        sb.append("卫戍协议 · 离线启动诊断\n\n");
+        sb.append("卫戍协议 · 启动诊断\n\n");
         sb.append("原因: ").append(why).append("\n\n");
-        sb.append("URL: ").append(AssetInterceptor.ORIGIN).append("/index.html?local=1\n");
-        sb.append("拦截成功: ").append(interceptor.servedCount())
-          .append("   未找到: ").append(interceptor.missingCount()).append('\n');
-        if (interceptor.lastServed() != null) sb.append("最后响应: ").append(interceptor.lastServed()).append('\n');
-        if (interceptor.lastMissing() != null) sb.append("最后一个 404: ").append(interceptor.lastMissing()).append('\n');
         sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
         sb.append("机型: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
+        sb.append("资源拦截: ").append(interceptor.servedCount())
+          .append(" 成功 / ").append(interceptor.missingCount()).append(" 未找到\n");
+        if (interceptor.lastServed() != null) sb.append("最后响应: ").append(interceptor.lastServed()).append('\n');
+        if (interceptor.lastMissing() != null) sb.append("最后一个 404: ").append(interceptor.lastMissing()).append('\n');
         sb.append(nativeInsets()).append('\n');
         String ua;
         try { ua = WebSettings.getDefaultUserAgent(this); } catch (Throwable t) { ua = "(unavailable)"; }
@@ -305,19 +363,21 @@ public class MainActivity extends Activity {
         if (overlay != null) overlay.setVisibility(View.GONE);
     }
 
-    /** Intercept our virtual origin, and report anything that went wrong. */
+    /** Serve the bundled assets, and report anything that went wrong. */
     private final class PageClient extends WebViewClient {
         @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+            // Only the bundled origin: in online mode every request goes to the server over the network, which is
+            // what the INTERNET permission is for.
             if (request.getUrl() != null && AssetInterceptor.HOST.equals(request.getUrl().getHost())) {
                 return interceptor.intercept(request);
             }
-            return null;                        // anything else has no permission and will fail: that is intended
+            return null;
         }
 
         @Override public void onPageFinished(WebView view, String url) {
             note("loaded " + url + " (intercepted " + interceptor.servedCount() + " requests)");
-            // The page's own safe-area variables are Chromium's (over-reported on this device); replace them with
-            // the real display-cutout values as soon as there is a document to inject into.
+            // The page's own safe-area variables are Chromium's (over-reported on the reference device); replace
+            // them with full-bleed values as soon as there is a document to inject into.
             applySafeArea();
         }
 
@@ -325,7 +385,11 @@ public class MainActivity extends Activity {
             String what = request != null && request.getUrl() != null ? request.getUrl().toString() : "?";
             String why = error != null ? (error.getErrorCode() + " " + error.getDescription()) : "unknown";
             note("onReceivedError " + what + " -> " + why);
-            if (request == null || request.isForMainFrame()) showOverlay("main frame failed: " + why + "  (" + what + ")");
+            if (request == null || request.isForMainFrame()) {
+                showOverlay("主页面加载失败: " + why + "\n" + what
+                        + "\n\n联机模式下请确认：地址填的是开服电脑的地址、手机和它在同一 Wi-Fi、"
+                        + "以及电脑上的游戏已经运行（npm start）。");
+            }
         }
 
         @Override public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse response) {
@@ -333,15 +397,18 @@ public class MainActivity extends Activity {
                 note("http " + (response != null ? response.getStatusCode() : "?") + " " + request.getUrl());
             }
             if (request != null && request.isForMainFrame()) {
-                showOverlay("main frame returned HTTP " + (response != null ? response.getStatusCode() : "?"));
+                showOverlay("主页面返回 HTTP " + (response != null ? response.getStatusCode() : "?")
+                        + "\n" + request.getUrl());
             }
         }
     }
 
+    // ---- window / lifecycle ----------------------------------------------------------------------------------
+
     @Override
     protected void onResume() {
         super.onResume();
-        goImmersive();
+        if (inGame) goImmersive(); else showSystemBars();
         if (web != null) web.onResume();
     }
 
@@ -350,7 +417,7 @@ public class MainActivity extends Activity {
         super.onWindowFocusChanged(hasFocus);
         // Several OEM builds (HyperOS/MIUI among them) bring the system bars back on the first focus change or after
         // a swipe; re-hiding them here is what actually keeps the game full-screen.
-        if (hasFocus) {
+        if (hasFocus && inGame) {
             goImmersive();
             applySafeArea();        // the visible system bars change what the safe area should be
         }
@@ -390,6 +457,17 @@ public class MainActivity extends Activity {
                             | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                             | View.SYSTEM_UI_FLAG_FULLSCREEN
                             | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        }
+    }
+
+    /** The launcher is an ordinary screen: let the content sit inside the system bars. */
+    private void showSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getWindow().setDecorFitsSystemWindows(true);
+            WindowInsetsController c = getWindow().getInsetsController();
+            if (c != null) c.show(WindowInsets.Type.systemBars());
+        } else {
+            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
         }
     }
 }
