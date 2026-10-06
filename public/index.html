@@ -42,7 +42,13 @@
   <link rel="stylesheet" href="/css/devices.css" />
 
   <script type="importmap">
-    { "imports": { "preact": "/vendor/preact.module.js", "preact/hooks": "/vendor/hooks.module.js", "htm": "/vendor/htm.module.js" } }
+    { "imports": {
+      "preact": "/vendor/preact.module.js",
+      "preact/hooks": "/vendor/hooks.module.js",
+      "htm": "/vendor/htm.module.js",
+      "node:crypto": "/js/local/node-crypto-shim.js",
+      "node:net": "/js/local/node-net-shim.js"
+    } }
   </script>
   <link rel="modulepreload" href="/vendor/preact.module.js" />
   <link rel="modulepreload" href="/vendor/hooks.module.js" />

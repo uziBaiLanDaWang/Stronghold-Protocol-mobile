@@ -2,6 +2,11 @@
 node_modules/
 # copied from node_modules by tools/vendor.mjs (postinstall); never commit third-party builds
 public/vendor/
+# tools/make-offline.mjs → the assembled offline tree (public/ + shared/ + sim/ + engine/ + data/);
+# regenerated on demand, and it duplicates assets when built with --with-assets
+dist/
+# tools/make-android-apk.mjs rasterises this from public/index.html's favicon path on every build
+android/res/mipmap-*/ic_launcher.png
 
 # --- game assets: (c) Hypergryph / Yostar, fetched or extracted locally, NEVER committed ----------
 # tools/fetch-assets.mjs → public/assets/** (~270 MB) and public/fonts/** (+ fonts.css)

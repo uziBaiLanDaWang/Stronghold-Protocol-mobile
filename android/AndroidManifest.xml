@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The offline-solo shell: a single WebView activity around the static tree that tools/make-offline.mjs assembles.
+  No server, no network, no permissions - the page is fed to the WebView straight out of the APK's assets by
+  AssetInterceptor (see android/java/**/AssetInterceptor.java for why interception rather than file:// or a loopback
+  HTTP server).
+
+  Landscape only (css/devices.css:3 designs for phones in landscape and index.html shows a full-screen "请将设备横屏"
+  overlay otherwise), and configChanges so a rotation or fold never restarts the activity mid-match.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.stronghold.offline"
+    android:versionCode="2"
+    android:versionName="0.1.4">
+
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="35" />
+
+    <!-- Touch input only; a gamepad/mouse is optional. NO INTERNET PERMISSION: the page is fed from the APK's own
+         assets by AssetInterceptor (shouldInterceptRequest), so the app never opens a socket - which is also why a
+         loopback HTTP server was dropped (loading http://127.0.0.1 in a WebView needs INTERNET, and without it
+         Chromium fails with net::ERR_ACCESS_DENIED). -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:hardwareAccelerated="true"
+        android:allowBackup="false"
+        android:largeHeap="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|density|uiMode|fontScale">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

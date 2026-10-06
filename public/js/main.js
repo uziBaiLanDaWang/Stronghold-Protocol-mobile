@@ -327,9 +327,18 @@ async function boot() {
     ui: { ...s.ui, pendingJoin },
   }));
 
+  // Offline solo mode (`?local=1`): run the real platform + match engine inside this page instead of connecting to
+  // a server (js/local/server.js). Installed before anything can open a socket; the engine is a dynamic import so an
+  // online player never downloads it.
+  const offline = (() => { try { return new URLSearchParams(location.search).get('local') === '1'; } catch { return false; } })();
+  const offlineReady = offline
+    ? import('./local/server.js').then((m) => m.installLocalServer()).then((api) => { globalThis.__SP_OFFLINE__ = api; return api; })
+    : null;
+
   wireNet();
   installLoadoutSync({ net });
-  net.attachBrowserHooks();
+  // The browser-hook listener only exists to reconnect a dropped socket; a local server has nothing to reconnect to.
+  if (!offline) net.attachBrowserHooks();
   // Audio: unlock on first gesture, BGM follows the route / match phase (js/audio.js).
   installAudio({ getManifest: () => data.get('assets'), subscribe: store.subscribe, getState: store.get, selectRoute, settings: settingsStore.get() });
   data.load('assets').catch(() => {});
@@ -338,7 +347,8 @@ async function boot() {
   // Optional local-client art manifest (emotes, tutorial pages, official UI sprites; DESIGN §13).
   data.load('local').catch(() => {});
 
-  const connectWhenReady = identityReady.then(() => {
+  const connectWhenReady = identityReady.then(async () => {
+    if (offlineReady) await offlineReady; // boots the in-page engine and injects net.WS
     if (entered) net.setName(savedName);
     else net.connect();
   });

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      A platform theme, so the shell needs no androidx/appcompat and can be built with nothing but the SDK's
+      build-tools (no Gradle, no Maven). The page paints the whole screen anyway; this only avoids a white flash
+      and a title bar before the WebView's first frame.
+    -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/boot_bg</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

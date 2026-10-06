@@ -28,6 +28,7 @@ English summary: [below](#english).
 
 - [声明](#声明) · [简介](#简介) · [功能一览](#功能一览)
 - [快速开始](#快速开始)：[整合包](#方式一整合包推荐) · [从源码运行](#方式二从源码运行) · [系统要求](#系统要求) · [端口与配置](#端口与配置) · [局域网联机](#和朋友一起玩局域网)
+- [离线单机（不需要服务器）](#离线单机不需要服务器)
 - [联机方式](#联机方式) · [操作](#操作) · [文档](#文档) · [开发与测试](#开发与测试) · [项目结构](#项目结构)
 - [许可证](#许可证) · [致谢与数据来源](#致谢与数据来源) · [贡献](#贡献)
 
@@ -57,6 +58,7 @@ English summary: [below](#english).
 - **交互细节**：漏怪时顶栏的目标生命值实时减少（结算时确定）；点选、拖放和配发装备都按地上的方格；购买、升级和机变选卡都需要点两次确认；只有一名玩家时除作战外不计时。
 - **画面与声音**：真实 Spine 小人、官方 BGM 与音效、表情（6 套 × 6 个）、作战特效；可选的官方 3D 棋盘（需要从本机客户端提取贴图）。
 - **手机与电脑**：触摸拖拽、长按查看详情，推荐横屏；设置里可以调低画质。
+- **离线单机**（实验）：`?local=1` 时整局在浏览器里跑，**不需要服务器**（见[离线单机](#离线单机不需要服务器)）。
 
 ## 快速开始
 
@@ -124,6 +126,22 @@ npm start          # 启动服务器：http://localhost:3000
 4. 同一 Wi-Fi / 路由器下的朋友打开启动窗口里列出的地址（形如 `http://192.168.x.x:3000`）即可。打不开时多半是防火墙：Windows 首次启动时在弹窗中允许「专用网络」，或运行 `npm run doctor` 查看具体命令；访客 Wi-Fi 常开启「AP 隔离」，也会导致连不上。
 
 刷新页面或断线后，同盟模拟 10 分钟内、独立模拟 24 小时内重新打开即可回到原座位。服务器把房间和对局都保存在内存里，**重启服务器会结束所有对局**。
+
+## 离线单机（不需要服务器）
+
+单人的「独立模拟」可以在浏览器里整局跑完，**不需要 Node、不需要 WebSocket**（实验性，地址后面加 `?local=1`）。
+
+这不需要移植：战斗本来就在浏览器里模拟（`SP_COMBAT=client`），而回合、经济、商店与波次的引擎 `server/match/**`、`server/sim/**` 和 `shared/**` 都是不依赖 Node 的 ES 模块。整个 `server/` 只有 `index.js`（http / fs）、`data.js`（读盘）、`sim/nodeData.js`（读盘）三个文件用到 Node API；引擎真正需要的 `net.js` 与 `lobby.js` 只用 `node:crypto` 和 `node:net`，`public/index.html` 的 import map 把它们映射到浏览器实现。所以离线模式没有重写协议，只是把唯一真正属于 Node 的东西——socket——换成页面内的一对内存 socket：`js/local/server.js` 让真实的 `Network` + `Lobby` + `Match` 跑在页面里，`js/local/socket-pair.js` 顶替一个 WebSocket，客户端照旧走 `public/js/net.js` 的完整流程（hello → welcome → room.create → room.start → m.public / m.private）。
+
+```bash
+npm run offline:build      # 组装成一个纯静态目录 dist/offline
+npx --yes serve dist/offline
+# 浏览器打开 http://<地址>/?local=1
+```
+
+- `npm run offline:build` 只是把 `public/`、`shared/`、`server/sim/`（→ `sim/`）、`server/`（→ `engine/`）、`data/` 和一份 `/data.js` 摆成静态目录，任何只会发文件的服务器都能托管，不需要认识这个游戏。加 `--with-assets` 会把 `public/assets/`（`npm run setup` 下载的美术音频，约 330 MB）一起复制进去，整个目录自包含，可以直接当作安卓 WebView 的资源目录。
+- 验证：`npm run offline:verify`（纯 Node、不需要浏览器：用真实引擎走一遍 hello → 建房 → 开始 → 选策略 → 商店）；`npm run offline:browser`（需要 Chrome：用一个只发文件、不含任何游戏代码的静态服务器托管 `dist/offline`，在浏览器里走完整界面流程并断言商店栏渲染出来）。
+- 目前只保证单人的「独立模拟」；同盟联机仍然需要服务器。操作与线上一致：仍然要输入代号，竖屏仍然显示「请将设备横屏」。
 
 ## 联机方式
 

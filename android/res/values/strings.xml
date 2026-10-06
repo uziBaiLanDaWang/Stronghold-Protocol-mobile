@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The page's own <title> says the same; this is what the launcher and the recents card show. -->
+    <string name="app_name">卫戍协议</string>
+</resources>

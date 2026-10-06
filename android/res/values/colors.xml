@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- index.html:8 <meta name="theme-color" content="#0c0f0e"> -->
+    <color name="boot_bg">#FF0C0F0E</color>
+</resources>
