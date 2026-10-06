@@ -36,7 +36,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ANDROID = path.join(ROOT, 'android');
 const OUT = path.join(ROOT, 'dist', 'android');
 const SITE = path.join(ROOT, 'dist', 'offline');
-const APP_VERSION = '0.1.4';
+const APP_VERSION = '0.1.4.1';
 
 const args = process.argv.slice(2);
 const argOf = (n, d) => { const i = args.indexOf(n); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
@@ -395,6 +395,54 @@ function checkMediaRouteMirror() {
   };
 }
 
+/**
+ * The web client and the Android shell are two languages joined by a handful of names and one scheme that no
+ * compiler checks: the property MainActivity installs, the modules shell.js imports, and the scheme the bundle is
+ * served on (a secure page may not open the plain ws:// a LAN server speaks). Each of them fails SILENTLY at
+ * runtime - the lobby's server field once shipped missing exactly that way - so the build checks them against the
+ * tree that is actually being packaged, which also catches a stale dist/offline.
+ */
+function checkShellBridgeMirror() {
+  const problems = [];
+  const readTree = (rel) => (existsSync(path.join(SITE, rel)) ? readFileSync(path.join(SITE, rel), 'utf8') : null);
+  const shell = readTree('js/shell.js');
+  if (!shell) return { ok: false, why: 'js/shell.js is not in dist/offline - run: node tools/make-offline.mjs --with-assets' };
+  const lobby = readTree('js/screens/lobby.js');
+  const localSrv = readTree('js/local/server.js');
+  const netjs = readTree('js/net.js');
+  if (!lobby || !localSrv || !netjs) return { ok: false, why: 'dist/offline is missing js modules' };
+
+  const exportsOf = (src) => new Set([...src.matchAll(/export\s+(?:async\s+)?(?:const|function|class)\s+(\w+)/g)].map((m) => m[1]));
+
+  // 1. the names the lobby imports from the bridge, and the ones shell.js imports dynamically
+  const imp = /import\s*\{([^}]*)\}\s*from\s*'\.\.\/shell\.js'/.exec(lobby);
+  if (!imp) problems.push('lobby.js does not import ../shell.js');
+  else {
+    const have = exportsOf(shell);
+    const missing = imp[1].split(',').map((s) => s.trim()).filter(Boolean).filter((w) => !have.has(w));
+    if (missing.length) problems.push(`shell.js does not export: ${missing.join(', ')}`);
+  }
+  for (const [spec, src, names] of [['./net.js', netjs, ['net']], ['./local/server.js', localSrv, ['detachLocalEngine']]]) {
+    if (!shell.includes(`import('${spec}')`)) { problems.push(`shell.js does not import ${spec}`); continue; }
+    const have = exportsOf(src);
+    const missing = names.filter((n) => !have.has(n));
+    if (missing.length) problems.push(`${spec} does not export: ${missing.join(', ')}`);
+  }
+
+  // 2. the property MainActivity installs is the one shell.js reads
+  const javaMain = readFileSync(path.join(ANDROID, 'java', 'com', 'stronghold', 'offline', 'MainActivity.java'), 'utf8');
+  const javaName = /BRIDGE_NAME\s*=\s*"([^"]+)"/.exec(javaMain)?.[1] ?? null;
+  const jsName = /globalThis\.([A-Za-z_$][\w$]*)\s*\?\?/.exec(shell)?.[1] ?? null;
+  if (!javaName || javaName !== jsName) problems.push(`bridge name: MainActivity installs "${javaName}", shell.js reads "${jsName}"`);
+
+  // 3. the bundle must not be https, or the client could never reach a ws:// server
+  const javaInterceptor = readFileSync(path.join(ANDROID, 'java', 'com', 'stronghold', 'offline', 'AssetInterceptor.java'), 'utf8');
+  const origin = /static final String ORIGIN\s*=\s*"(https?):\/\//.exec(javaInterceptor)?.[1] ?? null;
+  if (origin !== 'http') problems.push(`bundle origin is "${origin}": ws:// to a LAN server would be blocked as mixed content`);
+
+  return { ok: problems.length === 0, why: problems.join(' | '), detail: `${javaName} on ${origin}, imports resolve` };
+}
+
 async function main() {
   console.log('packaging the offline tree as an Android APK\n');
 
@@ -433,6 +481,11 @@ async function main() {
   step('checking the mirrored /media/ route');
   const mediaMirror = checkMediaRouteMirror();
   check(mediaMirror.ok, 'the shell mirrors shared/media.js', mediaMirror.ok ? mediaMirror.detail : mediaMirror.why);
+
+  step('checking the shell bridge name');
+  const bridgeMirror = checkShellBridgeMirror();
+  check(bridgeMirror.ok, 'MainActivity installs the property public/js/shell.js reads',
+    bridgeMirror.ok ? bridgeMirror.detail : bridgeMirror.why);
 
   // --- stage assets/web -> dist/offline -------------------------------------------------------------------
   // aapt2 links a directory of assets with -A, and the tree must sit under assets/web/ (AssetServer's ASSET_ROOT).

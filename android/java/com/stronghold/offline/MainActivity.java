@@ -16,6 +16,7 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
@@ -27,32 +28,38 @@ import android.widget.FrameLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 /**
- * The app: a launcher screen, and one WebView that plays the game either way.
+ * The app: one WebView that plays the client from either of two places.
  *
- * <p>Two modes, one client:
- * <ul>
- *   <li><b>Offline</b> - the copy of the client inside this APK, on the virtual asset origin with {@code ?local=1}
- *       (public/js/main.js), which boots the real match engine inside the page: solo play with no server and no
- *       network use at all.</li>
- *   <li><b>Online</b> - the client loaded <em>from a server</em>, exactly as a desktop browser does, so 1-4 player
- *       co-op works across devices. Loading the client from the server is deliberate: net.js verifies
- *       PROTOCOL_VERSION during the handshake and the server turns a stale client away, so a client bundled in the
- *       APK would break co-op as soon as the two builds drifted apart.</li>
- * </ul>
+ * <p>It starts on the copy inside the APK, on the virtual asset origin with {@code ?local=1} (public/js/main.js),
+ * which boots the real match engine inside the page - that is the offline game: solo, and co-op with AI teammates,
+ * with no server and no network use. There is no native launcher screen: the game's own title and lobby are the
+ * UI, and the lobby decides where to play.
  *
- * <p>The INTERNET permission exists for the online mode only; the offline mode never opens a socket (its assets are
- * served from the APK by {@link AssetInterceptor}, on a virtual origin nothing else can reach).
+ * <p>For cross-device co-op the lobby offers a server address (public/js/shell.js + the lobby's create box). The
+ * page cannot change origin by itself, so it asks this activity through {@link ShellBridge}, and the WebView then
+ * loads the client <em>from that server</em> - exactly what a desktop browser does, which is also what keeps the
+ * two in step: net.js checks PROTOCOL_VERSION during the handshake, so a client bundled in the APK would break
+ * co-op as soon as the two builds drifted apart.
+ *
+ * <p>The bridge is installed for the bundled page and removed before a server page is loaded, so a page served by
+ * someone else's server has no interface into the app at all. Back leaves a server and returns to the bundled
+ * client; back there leaves the app.
  *
  * <p>One diagnostic remains, only for the case where nothing can be seen: a full-screen report when the main frame
- * fails or the page has not booted within {@link #BOOT_TIMEOUT_MS}. It is invisible in normal use and a tap
+ * fails or the page has not booted within {@link #BOOT_TIMEOUT_MS}. It is invisible in normal use, and a tap
  * dismisses it.
  */
-public class MainActivity extends Activity implements StartScreen.Listener {
+public class MainActivity extends Activity {
 
     private static final String TAG = "StrongholdOffline";
     /** How long to wait for the page to boot before showing the full report. */
@@ -62,10 +69,21 @@ public class MainActivity extends Activity implements StartScreen.Listener {
     private static final int LOG_KEEP = 40;
     /** The bundled client, on the asset origin. */
     private static final String OFFLINE_URL = AssetInterceptor.ORIGIN + "/index.html?local=1";
+    /**
+     * The name the bundled page sees: window.__SP_SHELL__ (public/js/shell.js reads that exact property).
+     *
+     * This is a contract across two languages, and getting it wrong is SILENT: the page simply finds no bridge and
+     * behaves as if it were running in a plain browser - which is how the lobby's server field once went missing
+     * while everything else looked fine. tools/make-android-apk.mjs now compares this constant against shell.js at
+     * build time.
+     */
+    private static final String BRIDGE_NAME = "__SP_SHELL__";
+    /** Where the last server address the player used is kept. */
+    private static final String PREFS = "stronghold";
+    private static final String KEY_SERVER = "server";
 
     private WebView web;
     private AssetInterceptor interceptor;
-    private StartScreen start;
     private SharedPreferences prefs;
     private FrameLayout root;
     private ScrollView overlay;
@@ -73,8 +91,68 @@ public class MainActivity extends Activity implements StartScreen.Listener {
     private final List<String> log = Collections.synchronizedList(new ArrayList<String>());
     private final Handler handler = new Handler(Looper.getMainLooper());
     private volatile boolean booted;
-    /** A page is on screen (immersive, and back returns to the launcher). */
-    private boolean inGame;
+    /** The page on screen came out of the APK (the bridge exists for it). */
+    private volatile boolean bundledPage = true;
+
+    /**
+     * The whole interface the bundled page gets: where am I, what server did I use last, remember this one, take me
+     * there. Everything else the page does itself.
+     */
+    public class ShellBridge {
+        @JavascriptInterface public boolean bundled() { return bundledPage; }
+
+        @JavascriptInterface public String server() {
+            return prefs.getString(KEY_SERVER, "");
+        }
+
+        @JavascriptInterface public void setServer(String address) {
+            prefs.edit().putString(KEY_SERVER, address == null ? "" : address).apply();
+        }
+
+        /** Called from a background thread: WebView work has to go back to the UI thread. */
+        @JavascriptInterface public void connect(final String url) {
+            if (url == null || url.isEmpty()) return;
+            runOnUiThread(() -> {
+                if (url.startsWith("http://") || url.startsWith("https://")) loadServer(url);
+                else Log.w(TAG, "refusing to load " + url);
+            });
+        }
+
+        /**
+         * GET a URL and return its body ('' on any failure).
+         *
+         * Used for a server's /healthz: the page is served from the asset origin, so asking a server anything would
+         * be a cross-origin request and CORS-blocked. This is how the lobby finds out whether a server runs the same
+         * version as the client inside this APK, before that client connects to it.
+         *
+         * Runs on a JavaBridge thread (not the UI thread), so blocking I/O is fine here.
+         */
+        @JavascriptInterface public String probe(String url) {
+            if (url == null || !(url.startsWith("http://") || url.startsWith("https://"))) return "";
+            HttpURLConnection conn = null;
+            try {
+                conn = (HttpURLConnection) new URL(url).openConnection();
+                conn.setConnectTimeout(4000);
+                conn.setReadTimeout(4000);
+                conn.setRequestProperty("Accept", "application/json");
+                if (conn.getResponseCode() != 200) return "";
+                try (InputStream in = conn.getInputStream()) {
+                    ByteArrayOutputStream body = new ByteArrayOutputStream(1024);
+                    byte[] chunk = new byte[4096];
+                    int n;
+                    while ((n = in.read(chunk)) > 0 && body.size() < 64 * 1024) body.write(chunk, 0, n);
+                    return new String(body.toByteArray(), StandardCharsets.UTF_8);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "probe failed for " + url + ": " + e);
+                return "";
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }
+    }
+
+    private final ShellBridge bridge = new ShellBridge();
 
     /**
      * The probe asks the page what it has, and answers with a PLAIN-TEXT VERDICT PREFIX.
@@ -112,7 +190,7 @@ public class MainActivity extends Activity implements StartScreen.Listener {
 
     private final Runnable probe = new Runnable() {
         @Override public void run() {
-            if (web == null || !inGame) return;
+            if (web == null) return;
             web.evaluateJavascript(PROBE_JS, value -> {
                 String v = value == null ? "" : value;
                 note("probe: " + v);
@@ -126,7 +204,7 @@ public class MainActivity extends Activity implements StartScreen.Listener {
                     hideOverlay();
                     return;
                 }
-                if (!booted && inGame) handler.postDelayed(probe, PROBE_EVERY_MS);
+                if (!booted) handler.postDelayed(probe, PROBE_EVERY_MS);
             });
         }
     };
@@ -134,9 +212,7 @@ public class MainActivity extends Activity implements StartScreen.Listener {
     /** Fires if nothing has booted in time (a blank screen with no explanation is useless on a phone). */
     private final Runnable bootTimeout = new Runnable() {
         @Override public void run() {
-            if (inGame && !booted) {
-                showOverlay("the page did not boot within " + (BOOT_TIMEOUT_MS / 1000) + " s");
-            }
+            if (!booted) showOverlay("the page did not boot within " + (BOOT_TIMEOUT_MS / 1000) + " s");
         }
     };
 
@@ -144,7 +220,7 @@ public class MainActivity extends Activity implements StartScreen.Listener {
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        prefs = getSharedPreferences(StartScreen.PREFS, MODE_PRIVATE);
+        prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
 
         interceptor = new AssetInterceptor(getAssets());
 
@@ -190,30 +266,32 @@ public class MainActivity extends Activity implements StartScreen.Listener {
         overlay = buildOverlay();
         root.addView(overlay, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
-        start = new StartScreen(this, this);
-        root.addView(start.view(), new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         setContentView(root);
 
-        showStartScreen();
+        goImmersive();
+        loadBundled();
     }
 
-    // ---- the launcher's two choices --------------------------------------------------------------------------
+    // ---- which client is on screen --------------------------------------------------------------------------
 
-    @Override public void onOffline() {
-        loadGame(OFFLINE_URL, "bundled (offline; no network use at all)");
+    /** The offline client: the copy in this APK, with the local engine, and the bridge the lobby talks to. */
+    private void loadBundled() {
+        bundledPage = true;
+        web.addJavascriptInterface(bridge, BRIDGE_NAME);
+        load(OFFLINE_URL, "bundled (offline engine; no server, no network)");
     }
 
-    @Override public void onOnline(String url) {
-        prefs.edit().putString(StartScreen.KEY_SERVER, start.currentAddress()).apply();
-        loadGame(url, "server");
+    /** The client served by a server - the same thing a desktop browser loads, so co-op works across devices. */
+    private void loadServer(String url) {
+        bundledPage = false;
+        // No bridge for a page that came off the network: it has no business driving this activity.
+        web.removeJavascriptInterface(BRIDGE_NAME);
+        load(url, "server");
     }
 
-    private void loadGame(String url, String what) {
-        inGame = true;
+    private void load(String url, String what) {
         booted = false;
         hideOverlay();
-        start.hide();
         goImmersive();
         note("loading " + url + "  [" + what + "]");
         web.loadUrl(url);
@@ -223,21 +301,11 @@ public class MainActivity extends Activity implements StartScreen.Listener {
         handler.postDelayed(bootTimeout, BOOT_TIMEOUT_MS);
     }
 
-    /** Back from the game returns here; back again leaves the app. */
-    private void showStartScreen() {
-        inGame = false;
-        handler.removeCallbacks(probe);
-        handler.removeCallbacks(bootTimeout);
-        hideOverlay();
-        if (web != null) web.loadUrl("about:blank");      // releases the page (and, online, drops the room seat)
-        showSystemBars();
-        start.show(prefs.getString(StartScreen.KEY_SERVER, ""));
-    }
-
+    /** Back leaves a server (returning to the offline client); back there leaves the app. */
     @Override
     public void onBackPressed() {
-        if (inGame) {
-            showStartScreen();
+        if (!bundledPage) {
+            loadBundled();
             return;
         }
         super.onBackPressed();
@@ -325,7 +393,7 @@ public class MainActivity extends Activity implements StartScreen.Listener {
 
     /** Push {@link #safeAreaCss()} into the page (idempotent: one style element, rewritten each time). */
     private void applySafeArea() {
-        if (web == null || !inGame) return;
+        if (web == null) return;
         String css = safeAreaCss();
         // The CSS text contains no quotes, so it can sit inside a single-quoted JS string as-is.
         web.evaluateJavascript(
@@ -341,6 +409,7 @@ public class MainActivity extends Activity implements StartScreen.Listener {
         StringBuilder sb = new StringBuilder();
         sb.append("卫戍协议 · 启动诊断\n\n");
         sb.append("原因: ").append(why).append("\n\n");
+        sb.append("客户端来源: ").append(bundledPage ? "安装包（离线）" : "服务器").append('\n');
         sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
         sb.append("机型: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
         sb.append("资源拦截: ").append(interceptor.servedCount())
@@ -366,8 +435,8 @@ public class MainActivity extends Activity implements StartScreen.Listener {
     /** Serve the bundled assets, and report anything that went wrong. */
     private final class PageClient extends WebViewClient {
         @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-            // Only the bundled origin: in online mode every request goes to the server over the network, which is
-            // what the INTERNET permission is for.
+            // Only the bundled origin: on a server page every request goes to that server over the network, which
+            // is what the INTERNET permission is for.
             if (request.getUrl() != null && AssetInterceptor.HOST.equals(request.getUrl().getHost())) {
                 return interceptor.intercept(request);
             }
@@ -387,8 +456,8 @@ public class MainActivity extends Activity implements StartScreen.Listener {
             note("onReceivedError " + what + " -> " + why);
             if (request == null || request.isForMainFrame()) {
                 showOverlay("主页面加载失败: " + why + "\n" + what
-                        + "\n\n联机模式下请确认：地址填的是开服电脑的地址、手机和它在同一 Wi-Fi、"
-                        + "以及电脑上的游戏已经运行（npm start）。");
+                        + (bundledPage ? "" : "\n\n联机时请确认：地址是开服电脑的地址、手机和它在同一 Wi-Fi、"
+                        + "以及电脑上的游戏已在运行（npm start）。"));
             }
         }
 
@@ -408,7 +477,7 @@ public class MainActivity extends Activity implements StartScreen.Listener {
     @Override
     protected void onResume() {
         super.onResume();
-        if (inGame) goImmersive(); else showSystemBars();
+        goImmersive();
         if (web != null) web.onResume();
     }
 
@@ -417,7 +486,7 @@ public class MainActivity extends Activity implements StartScreen.Listener {
         super.onWindowFocusChanged(hasFocus);
         // Several OEM builds (HyperOS/MIUI among them) bring the system bars back on the first focus change or after
         // a swipe; re-hiding them here is what actually keeps the game full-screen.
-        if (hasFocus && inGame) {
+        if (hasFocus) {
             goImmersive();
             applySafeArea();        // the visible system bars change what the safe area should be
         }
@@ -457,17 +526,6 @@ public class MainActivity extends Activity implements StartScreen.Listener {
                             | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                             | View.SYSTEM_UI_FLAG_FULLSCREEN
                             | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
-        }
-    }
-
-    /** The launcher is an ordinary screen: let the content sit inside the system bars. */
-    private void showSystemBars() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            getWindow().setDecorFitsSystemWindows(true);
-            WindowInsetsController c = getWindow().getInsetsController();
-            if (c != null) c.show(WindowInsets.Type.systemBars());
-        } else {
-            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
         }
     }
 }

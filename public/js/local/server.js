@@ -152,3 +152,17 @@ export async function installLocalServer({ onFrame, onError } = {}) {
   globalThis.__SP_LOCAL__ = api;
   return api;
 }
+
+/**
+ * Let go of the in-process engine, handing net.js back to the browser's own WebSocket and to Net.prototype's own
+ * browser hooks (which {@link installLocalServer} had stubbed out).
+ *
+ * Used when the app points this page's client at a real server instead (public/js/shell.js): the client on the page
+ * keeps running - same code, same sim, same assets - and only its transport changes. The caller closes the client
+ * side first (`net.close()`), so nothing here can schedule a reconnect against a socket that is going away.
+ */
+export function detachLocalEngine() {
+  try { globalThis.__SP_LOCAL__?.dispose(); } catch { /* already gone */ }
+  net.WS = null;                  // connect() falls back to globalThis.WebSocket (net.js:218)
+  delete net.attachBrowserHooks;  // and to the prototype method the offline mode had replaced
+}

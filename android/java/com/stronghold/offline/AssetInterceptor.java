@@ -33,7 +33,17 @@ final class AssetInterceptor {
 
     /** The virtual origin: requests to it are served from assets, never from the network. */
     static final String HOST = "appassets.androidplatform.net";
-    static final String ORIGIN = "https://" + HOST;
+    /**
+     * The origin the bundled client is loaded on: plain http, NOT https.
+     *
+     * https was the first choice (a secure context), but it makes co-op with the bundled client impossible: a server
+     * on the local network speaks {@code ws://}, and a secure page may not open an insecure WebSocket - Chromium
+     * blocks it as mixed content. Loading the bundle over http puts the page and the server on the same scheme, so
+     * the client inside this APK can reach a server with nothing but a WebSocket, downloading nothing. Nothing in
+     * the client needs a secure context: it uses no {@code crypto.subtle} (only getRandomValues, which works
+     * anywhere) and the copy buttons fall back to {@code document.execCommand} (public/js/ui/clipboard.js:13).
+     */
+    static final String ORIGIN = "http://" + HOST;
 
     /** Directory inside assets/ holding the tree assembled by tools/make-offline.mjs. */
     private static final String ROOT = "web/";

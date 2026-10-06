@@ -10,7 +10,7 @@
 // plays 战场#01, 险境 draws one of 8, 绝境 / 终极 one of 7 (m01 excluded).
 
 import { useEffect, useRef, useState } from '../../vendor/hooks.module.js';
-import { DIFFICULTIES, DIFFICULTY_NAMES, DIFFICULTY_COLORS, ROOM_CODE_LEN, MAX_SEATS, MAX_SPECTATORS, modeIdFor, ERR } from '../../../shared/constants.js';
+import { DIFFICULTIES, DIFFICULTY_NAMES, DIFFICULTY_COLORS, ROOM_CODE_LEN, MAX_SEATS, MAX_SPECTATORS, modeIdFor, ERR, APP_VERSION } from '../../../shared/constants.js';
 import { html, Button, Icon, MicroLabel, Panel, TextField, PingPill, AvatarFrame, Tooltip, Spinner, DifficultyIcon, doctorNo } from '../ui/components.js';
 import { toast, toastError } from '../ui/toasts.js';
 import { GuideButton } from '../ui/guide.js';
@@ -18,6 +18,8 @@ import { LoadoutButton } from './loadout.js';
 import { net, identity } from '../net.js';
 import { store, useStore, shallowEqual, loadPref, savePref } from '../store.js';
 import { getConfig, getMode, getStage, useData } from '../data.js';
+import { isBundled, shellServer, rememberServer, shellConnect, normalizeServer, serverRootFor, DEFAULT_SERVER_PORT,
+  probeServer, connectWithLocalClient, remoteServerUrl, backToLocalClient } from '../shell.js';
 
 /** Official mode texts (activity_table act2autochess.modeDataDict), fallback when config.json is absent. */
 export const MODE_TEXT = {
@@ -246,9 +248,61 @@ export function LobbyScreen() {
 
   const online = conn.status === 'online';
   const codeOk = CODE_RE.test(code);
+  // The APK runs this same client in two places: from its own bundle (the offline engine, a server of one) and from
+  // a real server. Only in the first case is there anything to choose - see public/js/shell.js.
+  const bundled = isBundled();
+  const [server, setServer] = useState(() => shellServer());
+  const [remote, setRemote] = useState(() => remoteServerUrl());
+  const [mismatch, setMismatch] = useState(null);
+  const serverUrl = normalizeServer(server);
+  const serverTyped = server.trim().length > 0;
 
   const pickMode = (m) => { setRoomMode(m); savePref('lobby.mode', m); };
   const pickDifficulty = (d) => { setDifficulty(d); savePref('lobby.difficulty', d); };
+
+  /**
+   * Connect to the server the player named, using the client ON THIS PAGE rather than fetching that server's copy
+   * of it: the client, its art, its data and its battle sim are already here (in the APK), so nothing but one
+   * WebSocket crosses the network.
+   *
+   * Both ends then run the same code - but only if they are the same build, and the sim is what decides a battle, so
+   * a confirmed version difference stops here and offers the other route instead: load the client FROM that server,
+   * which is guaranteed to match it.
+   */
+  const connectToServer = async () => {
+    if (!serverUrl) {
+      toast(`服务器地址看起来不对，例如 192.168.1.5:${DEFAULT_SERVER_PORT}`, 'warn');
+      return false;
+    }
+    rememberServer(server);
+    setBusy('connect');
+    try {
+      const health = probeServer(serverUrl);
+      if (health && health.app && APP_VERSION && health.app !== APP_VERSION) {
+        setMismatch(health);
+        toast(`该服务器是 ${health.app}，本机客户端是 ${APP_VERSION}：建议改用服务器的客户端`, 'warn', { ttl: 9000 });
+        return false;
+      }
+      setMismatch(null);
+      await connectWithLocalClient(serverUrl);
+      setRemote(serverUrl);
+      return true;
+    } catch (err) {
+      toastError(err);
+      return false;
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  /** The other route: leave this page for the server's own client (used when the versions differ). */
+  const useServerClient = () => {
+    rememberServer(server);
+    if (!shellConnect(serverUrl)) toast('网页版无法切换服务器：请直接打开该服务器地址', 'warn');
+  };
+
+  /** Back to the offline engine (the page reloads and reinstalls it). */
+  const disconnect = () => backToLocalClient();
 
   const run = async (kind, fn) => {
     if (inFlight.current) return;
@@ -260,7 +314,16 @@ export function LobbyScreen() {
       if (alive.current) setBusy(null);
     }
   };
-  const create = () => run('create', () => net.request('room.create', { mode: roomMode, difficulty }));
+  const create = () => {
+    // In the bundled client a filled-in server means "play over there": connect first, then create - for either
+    // mode (a server runs 独立模拟 too). With the field left empty this stays local: solo, or co-op with AI
+    // teammates on this one device.
+    if (bundled && serverTyped && !remote) {
+      connectToServer();
+      return undefined;
+    }
+    return run('create', () => net.request('room.create', { mode: roomMode, difficulty }));
+  };
   const join = (c = code) => {
     // `onClick=${join}` hands the click EVENT as the first argument, and a default parameter only applies to
     // `undefined` — codeArg keeps an event target out of the key and falls back to the input field
@@ -339,6 +402,23 @@ export function LobbyScreen() {
               : html`<span class="t-dim">向同伴索取 ${ROOM_CODE_LEN} 位同盟密钥，或直接打开邀请链接</span>`}
           </div>
         <//>
+
+        ${bundled ? html`
+          <${Panel} class="join-panel server-panel" tone="mint">
+            <${TextField} icon="link" value=${server} label="联机服务器" micro="CO-OP SERVER"
+              placeholder=${`留空＝本机运行；填 192.168.1.5:${DEFAULT_SERVER_PORT} 联机`}
+              invalid=${serverTyped && !serverUrl}
+              onInput=${setServer} onEnter=${() => connectToServer()} />
+            ${remote
+              ? html`<${Button} variant="secondary" size="lg" icon="exit" block=${true}
+                  onClick=${disconnect}>断开（回到本机）<//>`
+              : html`<${Button} variant="secondary" size="lg" icon="link" block=${true}
+                  disabled=${!serverUrl} loading=${busy === 'connect'}
+                  onClick=${() => connectToServer()}>连接服务器<//>`}
+            ${mismatch ? html`<${Button} variant="ghost" size="sm" block=${true} icon="users"
+                onClick=${useServerClient}>改用服务器的客户端（该服务器是 ${mismatch.app}）<//>` : null}
+          <//>
+        ` : null}
         <${TipsPanel} />
       </section>
 

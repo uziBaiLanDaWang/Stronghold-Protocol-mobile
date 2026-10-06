@@ -171,7 +171,7 @@ async function main() {
   if (!jar) die('No JDK found (needs jar to write the zip). Set JAVA_HOME and retry.');
 
   // The bundle name follows the project's own release convention.
-  const appVersion = /(\d+\.\d+\.\d+)/.exec(apkName)?.[1] ?? '0.0.0';
+  const appVersion = /(\d+\.\d+\.\d+(?:\.\d+)?)/.exec(apkName)?.[1] ?? '0.0.0';
   const bundle = NAME || `Stronghold-Protocol-Offline-Android-${appVersion}`;
 
   rmSync(OUT, { recursive: true, force: true });
